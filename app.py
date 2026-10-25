@@ -2,8 +2,9 @@ import os
 import pickle
 import numpy as np
 from datetime import datetime
-from dotenv import load_dotenv
+from pathlib import Path
 
+from dotenv import load_dotenv
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_login import (
     LoginManager,
@@ -11,40 +12,69 @@ from flask_login import (
     login_user,
     logout_user,
     login_required,
-    current_user
+    current_user,
 )
 from flask_bcrypt import Bcrypt
+from sqlalchemy.engine import URL
 
 from db import db
+
 
 load_dotenv()
 
 app = Flask(__name__)
 
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "cropwise_default_secret_key")
+# No hardcoded production secrets. Define these values in .env locally and
+# Koyeb's Secrets/Environment Variables settings online.
+secret_key = os.getenv("SECRET_KEY")
+if not secret_key:
+    raise RuntimeError("Missing SECRET_KEY. Configure it in .env or Koyeb settings.")
+app.config["SECRET_KEY"] = secret_key
 
-
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if DATABASE_URL:
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+# Database connection: supports a DATABASE_URL from Supabase/Koyeb or the
+# existing DB_* variables used by this project.
+database_url = os.getenv("DATABASE_URL")
+if database_url:
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 else:
-    DB_USER = os.getenv("DB_USER")
-    DB_PASSWORD = os.getenv("DB_PASSWORD")
-    DB_HOST = os.getenv("DB_HOST")
-    DB_PORT = os.getenv("DB_PORT")
-    DB_NAME = os.getenv("DB_NAME")
-
-    app.config["SQLALCHEMY_DATABASE_URI"] = (
-        f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    db_options = {
+        "DB_USER": os.getenv("DB_USER"),
+        "DB_PASSWORD": os.getenv("DB_PASSWORD"),
+        "DB_HOST": os.getenv("DB_HOST"),
+        "DB_PORT": os.getenv("DB_PORT"),
+        "DB_NAME": os.getenv("DB_NAME"),
+    }
+    missing = [key for key, value in db_options.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Missing DATABASE_URL or database settings: " + ", ".join(missing)
+        )
+    # URL.create correctly handles special characters in DB_PASSWORD.
+    database_url = URL.create(
+        "postgresql+psycopg",
+        username=db_options["DB_USER"],
+        password=db_options["DB_PASSWORD"],
+        host=db_options["DB_HOST"],
+        port=int(db_options["DB_PORT"]),
+        database=db_options["DB_NAME"],
     )
 
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+}
 
+is_production = os.getenv("APP_ENV", "development").lower() == "production"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = is_production
+
+# Keep existing login, models, and the project's db.py SQLAlchemy instance.
 db.init_app(app)
 bcrypt = Bcrypt(app)
 
@@ -52,7 +82,6 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
 login_manager.login_message_category = "danger"
-
 
 
 class User(db.Model, UserMixin):
@@ -68,7 +97,7 @@ class User(db.Model, UserMixin):
         "PredictionHistory",
         backref="user",
         lazy=True,
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
 
 
@@ -92,19 +121,21 @@ class PredictionHistory(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    try:
+        return db.session.get(User, int(user_id))
+    except (TypeError, ValueError):
+        return None
 
 
-
-MODEL_PATH = os.path.join(app.root_path, "RandomForest.pkl")
+MODEL_PATH = Path(app.root_path) / "RandomForest.pkl"
 
 try:
-    with open(MODEL_PATH, "rb") as file:
+    with MODEL_PATH.open("rb") as file:
+        # Only load pickle files from your own trusted project.
         model = pickle.load(file)
 except FileNotFoundError:
     model = None
-    print("ERROR: RandomForest.pkl was not found. Make sure it is in the project root.")
-
+    app.logger.error("RandomForest.pkl was not found in the project root.")
 
 
 CROP_INFO = {
@@ -112,147 +143,153 @@ CROP_INFO = {
         "image": "rice.jpg",
         "reason": "Rice grows well in warm temperatures, high humidity, and areas with sufficient rainfall. It is suitable for soil conditions that can hold water.",
         "fertilizer": "Use nitrogen-rich fertilizer such as urea, and apply phosphorus and potassium based on soil test results.",
-        "tips": "Maintain proper water levels in the field and avoid over-flooding during early growth stages."
+        "tips": "Maintain proper water levels in the field and avoid over-flooding during early growth stages.",
     },
     "maize": {
         "image": "maize.jpg",
         "reason": "Maize is suitable for moderately warm temperatures, balanced nutrients, and well-drained soil.",
         "fertilizer": "Apply nitrogen fertilizer during early growth and add phosphorus for strong root development.",
-        "tips": "Plant in rows with proper spacing and ensure enough sunlight exposure."
+        "tips": "Plant in rows with proper spacing and ensure enough sunlight exposure.",
     },
     "chickpea": {
         "image": "chickpea.jpg",
         "reason": "Chickpea performs well in dry and cool conditions with moderate soil nutrients.",
         "fertilizer": "Use phosphorus-based fertilizer and avoid too much nitrogen because chickpea can fix nitrogen naturally.",
-        "tips": "Avoid waterlogging and plant in well-drained soil."
+        "tips": "Avoid waterlogging and plant in well-drained soil.",
     },
     "kidneybeans": {
         "image": "kidneybeans.jpg",
         "reason": "Kidney beans grow best in fertile, well-drained soil with moderate temperature and moisture.",
         "fertilizer": "Use compost and phosphorus-rich fertilizer to support pod formation.",
-        "tips": "Avoid excessive watering and provide support if needed."
+        "tips": "Avoid excessive watering and provide support if needed.",
     },
     "pigeonpeas": {
         "image": "pigeonpeas.jpg",
         "reason": "Pigeon peas tolerate dry conditions and grow well in moderate soil fertility.",
         "fertilizer": "Apply phosphorus fertilizer and organic compost before planting.",
-        "tips": "Plant in sunny areas and avoid heavy waterlogged soil."
+        "tips": "Plant in sunny areas and avoid heavy waterlogged soil.",
     },
     "mothbeans": {
         "image": "mothbeans.jpg",
         "reason": "Moth beans are drought-tolerant and suitable for dry soil conditions.",
         "fertilizer": "Use organic manure and small amounts of phosphorus fertilizer.",
-        "tips": "Best grown in warm climates with minimal irrigation."
+        "tips": "Best grown in warm climates with minimal irrigation.",
     },
     "mungbean": {
         "image": "mungbean.jpg",
         "reason": "Mungbean grows well in warm temperatures with moderate rainfall and well-drained soil.",
         "fertilizer": "Apply phosphorus and potassium fertilizer. Avoid too much nitrogen.",
-        "tips": "Use good-quality seeds and avoid planting during heavy rain."
+        "tips": "Use good-quality seeds and avoid planting during heavy rain.",
     },
     "blackgram": {
         "image": "blackgram.jpg",
         "reason": "Blackgram is suitable for warm climates and moderate soil moisture.",
         "fertilizer": "Use compost and phosphorus fertilizer for better root and pod growth.",
-        "tips": "Avoid waterlogging and control weeds during early growth."
+        "tips": "Avoid waterlogging and control weeds during early growth.",
     },
     "lentil": {
         "image": "lentil.jpg",
         "reason": "Lentil grows best in cool weather and well-drained soil with moderate fertility.",
         "fertilizer": "Apply phosphorus fertilizer and organic matter.",
-        "tips": "Do not over-irrigate because lentils are sensitive to excess water."
+        "tips": "Do not over-irrigate because lentils are sensitive to excess water.",
     },
     "pomegranate": {
         "image": "pomegranate.jpg",
         "reason": "Pomegranate is suitable for warm and dry climates with well-drained soil.",
         "fertilizer": "Use compost, potassium, and balanced NPK fertilizer.",
-        "tips": "Prune regularly and avoid excessive irrigation."
+        "tips": "Prune regularly and avoid excessive irrigation.",
     },
     "banana": {
         "image": "banana.jpg",
         "reason": "Banana needs high humidity, warm temperature, and nutrient-rich soil.",
         "fertilizer": "Apply potassium-rich fertilizer, compost, and nitrogen during vegetative growth.",
-        "tips": "Keep soil moist and protect plants from strong winds."
+        "tips": "Keep soil moist and protect plants from strong winds.",
     },
     "mango": {
         "image": "mango.jpg",
         "reason": "Mango grows well in warm climates with moderate rainfall and well-drained soil.",
         "fertilizer": "Apply organic compost and balanced NPK fertilizer.",
-        "tips": "Avoid waterlogging and prune trees to improve fruit production."
+        "tips": "Avoid waterlogging and prune trees to improve fruit production.",
     },
     "grapes": {
         "image": "grapes.jpg",
         "reason": "Grapes prefer warm temperatures, good sunlight, and well-drained soil.",
         "fertilizer": "Use potassium and phosphorus fertilizer during flowering and fruiting.",
-        "tips": "Provide trellis support and prune vines regularly."
+        "tips": "Provide trellis support and prune vines regularly.",
     },
     "watermelon": {
         "image": "watermelon.jpg",
         "reason": "Watermelon grows well in warm soil, high sunlight, and moderate rainfall.",
         "fertilizer": "Use compost and potassium-rich fertilizer for fruit development.",
-        "tips": "Provide wide spacing and avoid overhead watering."
+        "tips": "Provide wide spacing and avoid overhead watering.",
     },
     "muskmelon": {
         "image": "muskmelon.jpg",
         "reason": "Muskmelon is suitable for warm and dry conditions with well-drained soil.",
         "fertilizer": "Apply compost and potassium fertilizer.",
-        "tips": "Use mulching to conserve soil moisture."
+        "tips": "Use mulching to conserve soil moisture.",
     },
     "apple": {
         "image": "apple.jpg",
         "reason": "Apple grows best in cooler climates with balanced nutrients and proper soil moisture.",
         "fertilizer": "Use nitrogen, phosphorus, and potassium depending on tree age and soil test.",
-        "tips": "Prune yearly and protect from pests and fungal diseases."
+        "tips": "Prune yearly and protect from pests and fungal diseases.",
     },
     "orange": {
         "image": "orange.jpg",
         "reason": "Orange prefers warm climates, moderate rainfall, and slightly acidic to neutral soil.",
         "fertilizer": "Use citrus fertilizer with nitrogen, potassium, and micronutrients.",
-        "tips": "Water regularly but avoid waterlogging."
+        "tips": "Water regularly but avoid waterlogging.",
     },
     "papaya": {
         "image": "papaya.jpg",
         "reason": "Papaya grows well in warm temperatures, high humidity, and fertile soil.",
         "fertilizer": "Apply compost and balanced NPK fertilizer regularly.",
-        "tips": "Plant in sunny areas and protect from strong winds."
+        "tips": "Plant in sunny areas and protect from strong winds.",
     },
     "coconut": {
         "image": "coconut.jpg",
         "reason": "Coconut is suitable for humid tropical areas with high rainfall and sandy or loamy soil.",
         "fertilizer": "Use potassium-rich fertilizer and organic manure.",
-        "tips": "Maintain proper spacing and provide irrigation during dry months."
+        "tips": "Maintain proper spacing and provide irrigation during dry months.",
     },
     "cotton": {
         "image": "cotton.jpg",
         "reason": "Cotton grows well in warm climates with moderate rainfall and fertile soil.",
         "fertilizer": "Apply nitrogen, phosphorus, and potassium fertilizer based on soil needs.",
-        "tips": "Control weeds and pests early to protect boll formation."
+        "tips": "Control weeds and pests early to protect boll formation.",
     },
     "jute": {
         "image": "jute.jpg",
         "reason": "Jute grows well in warm, humid conditions with high rainfall.",
         "fertilizer": "Use nitrogen and phosphorus fertilizer with organic compost.",
-        "tips": "Keep the field moist and harvest at the right maturity stage."
+        "tips": "Keep the field moist and harvest at the right maturity stage.",
     },
     "coffee": {
         "image": "coffee.jpg",
         "reason": "Coffee grows best in moderate temperatures, good rainfall, and slightly acidic soil.",
         "fertilizer": "Use organic compost, nitrogen, and potassium fertilizer.",
-        "tips": "Provide partial shade and maintain proper pruning."
-    }
+        "tips": "Provide partial shade and maintain proper pruning.",
+    },
 }
-
 
 
 def get_crop_image_url(image_name):
     image_path = f"images/crops/{image_name}"
-    full_image_path = os.path.join(app.root_path, "static", image_path)
+    full_image_path = Path(app.root_path) / "static" / image_path
 
-    if os.path.exists(full_image_path):
+    if full_image_path.exists():
         return url_for("static", filename=image_path)
 
     return url_for("static", filename="images/crops/default.jpg")
 
+
+@app.route("/health")
+def health():
+    # Lightweight endpoint to verify the application and model startup.
+    if model is None:
+        return jsonify({"status": "model_missing"}), 503
+    return jsonify({"status": "ok", "model": "loaded"}), 200
 
 
 @app.route("/")
@@ -279,11 +316,7 @@ def signup():
 
         hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
 
-        new_user = User(
-            fullname=fullname,
-            email=email,
-            password=hashed_password
-        )
+        new_user = User(fullname=fullname, email=email, password=hashed_password)
 
         db.session.add(new_user)
         db.session.commit()
@@ -324,45 +357,37 @@ def dashboard():
 @login_required
 def predict():
     if model is None:
-        return jsonify({
-            "error": "Model file was not found. Please upload RandomForest.pkl."
-        }), 500
+        return jsonify({"error": "Machine learning model is unavailable."}), 503
 
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "A JSON object with crop inputs is required."}), 400
 
-        nitrogen = float(data["nitrogen"])
-        phosphorus = float(data["phosphorus"])
-        potassium = float(data["potassium"])
-        temperature = float(data["temperature"])
-        humidity = float(data["humidity"])
-        ph = float(data["ph"])
-        rainfall = float(data["rainfall"])
+        input_names = (
+            "nitrogen", "phosphorus", "potassium", "temperature",
+            "humidity", "ph", "rainfall"
+        )
+        values = [float(data[name]) for name in input_names]
+        input_data = np.array([values], dtype=float)
 
-        input_data = np.array([[
-            nitrogen,
-            phosphorus,
-            potassium,
-            temperature,
-            humidity,
-            ph,
-            rainfall
-        ]])
+        if not np.isfinite(input_data).all():
+            return jsonify({"error": "Inputs must contain finite numeric values."}), 400
 
-        predicted_crop = model.predict(input_data)[0]
+        # Preserve the exact trained feature order in the original application.
+        predicted_crop = str(model.predict(input_data)[0]).strip().lower()
 
         history = PredictionHistory(
             user_id=current_user.id,
-            nitrogen=nitrogen,
-            phosphorus=phosphorus,
-            potassium=potassium,
-            temperature=temperature,
-            humidity=humidity,
-            ph=ph,
-            rainfall=rainfall,
-            predicted_crop=predicted_crop
+            nitrogen=values[0],
+            phosphorus=values[1],
+            potassium=values[2],
+            temperature=values[3],
+            humidity=values[4],
+            ph=values[5],
+            rainfall=values[6],
+            predicted_crop=predicted_crop,
         )
-
         db.session.add(history)
         db.session.commit()
 
@@ -370,7 +395,7 @@ def predict():
             "image": "default.jpg",
             "reason": "This crop matches the provided soil and climate conditions.",
             "fertilizer": "Use balanced fertilizer based on soil testing.",
-            "tips": "Monitor moisture, soil pH, and pest activity regularly."
+            "tips": "Monitor moisture, soil pH, and pest activity regularly.",
         })
 
         image_url = get_crop_image_url(crop_details["image"])
@@ -380,14 +405,15 @@ def predict():
             "image": image_url,
             "reason": crop_details["reason"],
             "fertilizer": crop_details["fertilizer"],
-            "tips": crop_details["tips"]
+            "tips": crop_details["tips"],
         })
 
-    except Exception as e:
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"Invalid crop input: {exc}"}), 400
+    except Exception:
         db.session.rollback()
-        return jsonify({
-            "error": f"Prediction failed: {str(e)}"
-        }), 500
+        app.logger.exception("Crop prediction failed")
+        return jsonify({"error": "Prediction failed. Please try again."}), 500
 
 
 @app.route("/history")
@@ -407,10 +433,7 @@ def logout():
     return redirect(url_for("landing"))
 
 
-
-with app.app_context():
-    db.create_all()
-
-
+# Database initialization is intentionally not performed at import/startup.
+# Run `python init_db.py` once against the intended database instead.
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.getenv("FLASK_DEBUG", "0") == "1")
